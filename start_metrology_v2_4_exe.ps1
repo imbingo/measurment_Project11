@@ -62,6 +62,8 @@ function Install-BundledTesseract {
 
 function Resolve-AppExe {
     $candidates = @(
+        (Join-Path $PSScriptRoot "metrology_data_platform_v2_5\metrology_data_platform_v2_5.exe"),
+        (Join-Path $PSScriptRoot "dist_exe\metrology_data_platform_v2_5\metrology_data_platform_v2_5.exe"),
         (Join-Path $PSScriptRoot "metrology_data_platform_v2_4\metrology_data_platform_v2_4.exe"),
         (Join-Path $PSScriptRoot "dist_exe\metrology_data_platform_v2_4\metrology_data_platform_v2_4.exe")
     )
@@ -71,11 +73,11 @@ function Resolve-AppExe {
             return (Resolve-Path -LiteralPath $candidate).Path
         }
     }
-    throw "Metrology exe was not found. Keep this script together with the metrology_data_platform_v2_4 folder."
+    throw "Metrology exe was not found. Keep this script together with the metrology_data_platform_v2_5 folder."
 }
 
 Write-Host "============================================================"
-Write-Host "Metrology Data Platform V2.4 - EXE offline startup"
+Write-Host "Metrology Data Platform V2.5 - EXE offline startup"
 Write-Host "Python is bundled inside the exe package; production PC does not need Python."
 Write-Host "============================================================"
 

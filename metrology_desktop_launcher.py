@@ -12,8 +12,10 @@ from pathlib import Path
 from tkinter import BOTH, LEFT, RIGHT, StringVar, Tk, messagebox, ttk
 
 
-APP_EXE_DIR = "metrology_data_platform_v2_4"
-APP_EXE_NAME = "metrology_data_platform_v2_4.exe"
+APP_EXE_CANDIDATES = [
+    ("metrology_data_platform_v2_5", "metrology_data_platform_v2_5.exe"),
+    ("metrology_data_platform_v2_4", "metrology_data_platform_v2_4.exe"),
+]
 CONFIG_FILE = "metrology_launcher_config.json"
 
 
@@ -24,10 +26,12 @@ def base_dir() -> Path:
 
 
 def find_app_exe(root: Path) -> Path | None:
-    candidates = [
-        root / APP_EXE_DIR / APP_EXE_NAME,
-        root / "dist_exe" / APP_EXE_DIR / APP_EXE_NAME,
-    ]
+    candidates = []
+    for exe_dir, exe_name in APP_EXE_CANDIDATES:
+        candidates.extend([
+            root / exe_dir / exe_name,
+            root / "dist_exe" / exe_dir / exe_name,
+        ])
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -101,7 +105,7 @@ def is_url_ready(url: str) -> bool:
     try:
         with urllib.request.urlopen(version_url(url), timeout=1.5) as response:
             text = response.read(512).decode("utf-8", errors="ignore")
-            return response.status == 200 and "V2.4" in text
+            return response.status == 200 and "Metrology Config App" in text
     except Exception:
         return False
 
@@ -144,7 +148,7 @@ def open_desktop_window(url: str) -> None:
         raise RuntimeError("pywebview runtime is missing from the launcher package.") from exc
 
     webview.create_window(
-        "量测数据采集平台 V2.4",
+        "量测数据采集平台 V2.5",
         url,
         width=1280,
         height=860,
@@ -193,7 +197,7 @@ class LauncherApp:
         frame = ttk.Frame(self.root_window, padding=18)
         frame.pack(fill=BOTH, expand=True)
 
-        title = ttk.Label(frame, text="量测数据采集平台 V2.4", font=("Microsoft YaHei UI", 15, "bold"))
+        title = ttk.Label(frame, text="量测数据采集平台 V2.5", font=("Microsoft YaHei UI", 15, "bold"))
         title.pack(anchor="w")
 
         subtitle = ttk.Label(frame, text="启动后台服务，或连接已有服务器，并在独立桌面窗口中登录")
@@ -274,7 +278,8 @@ class LauncherApp:
             if mode in ("local", "lan"):
                 app_exe = find_app_exe(self.root_path)
                 if not app_exe:
-                    messagebox.showerror("找不到主程序", f"请确认 {APP_EXE_DIR}\\{APP_EXE_NAME} 和本启动器在同一个包内。")
+                    expected = " 或 ".join(f"{exe_dir}\\{exe_name}" for exe_dir, exe_name in APP_EXE_CANDIDATES)
+                    messagebox.showerror("找不到主程序", f"请确认 {expected} 和本启动器在同一个包内。")
                     return
 
                 if not is_url_ready(target_url):

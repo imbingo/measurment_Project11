@@ -53,8 +53,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
-APP_VERSION = "V2.4"
-APP_TITLE = "量测数据采集配置平台 V2.4 - 图片 OCR 数据源增强版"
+APP_VERSION = "V2.5"
+APP_TITLE = "量测数据采集配置平台 V2.5 - 图片 OCR 自动分拣版"
 DB_FILE = "metrology_config_v1.db"
 HOST = os.environ.get("MDCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MDCP_PORT", "8023"))
@@ -78,6 +78,10 @@ DEFAULT_DATA_SOURCE_PATH_EXAMPLE = r"\\192.168.1.100\share\result.xlsx"
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 DEFAULT_IMAGE_PARSE_CONFIG_JSON = json.dumps({
     "file_pattern": "*",
+    "collect_mode": "latest",
+    "max_files_per_collect": 50,
+    "route_by_image_production_code": False,
+    "production_code_from_filename_regex": "",
     "process_from_filename_regex": "",
     "ocr": {
         "lang": "eng",
@@ -622,6 +626,23 @@ def has_glob_pattern(path: str) -> bool:
     return any(ch in (path or "") for ch in "*?[")
 
 
+def truthy_config(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def validate_regex(pattern: str, label: str):
+    if not str(pattern or "").strip():
+        return
+    try:
+        re.compile(pattern)
+    except re.error as ex:
+        raise ValueError(f"Invalid Image OCR regex for {label}: {ex}") from ex
+
+
 def normalize_image_roi(roi, metric_name=""):
     if isinstance(roi, dict):
         values = [roi.get("x"), roi.get("y"), roi.get("w", roi.get("width")), roi.get("h", roi.get("height"))]
@@ -638,6 +659,41 @@ def normalize_image_roi(roi, metric_name=""):
     return [x, y, w, hgt]
 
 
+def get_image_metadata_field_config(config: dict, field_name: str):
+    fields = config.get("fields")
+    aliases = {
+        "production_code": ("production_code", "生产编号", "prod_code"),
+        "process_step": ("process_step", "工序", "工序名", "step"),
+    }.get(field_name, (field_name,))
+    if isinstance(fields, dict):
+        for alias in aliases:
+            field_cfg = fields.get(alias)
+            if isinstance(field_cfg, dict):
+                return field_cfg
+    legacy_cfg = config.get(f"{field_name}_ocr")
+    if isinstance(legacy_cfg, dict):
+        return legacy_cfg
+    return None
+
+
+def image_config_routes_by_production(config: dict):
+    if truthy_config(config.get("route_by_image_production_code")):
+        return True
+    if str(config.get("production_code_from_filename_regex") or config.get("filename_production_code_regex") or "").strip():
+        return True
+    return get_image_metadata_field_config(config, "production_code") is not None
+
+
+def image_config_process_column(config: dict, configured_process_column: str):
+    configured_process_column = (configured_process_column or "").strip()
+    if configured_process_column:
+        return configured_process_column
+    has_filename_process = str(config.get("process_from_filename_regex") or config.get("filename_process_regex") or "").strip()
+    if has_filename_process or get_image_metadata_field_config(config, "process_step"):
+        return "process_step"
+    return ""
+
+
 def parse_image_parse_config(config_json: str, required_metric_columns=None):
     if not str(config_json or "").strip():
         raise ValueError("Image OCR config JSON is required.")
@@ -650,6 +706,18 @@ def parse_image_parse_config(config_json: str, required_metric_columns=None):
     metric_configs = config.get("metrics")
     if not isinstance(metric_configs, dict) or not metric_configs:
         raise ValueError("Image OCR config JSON must include a non-empty metrics object.")
+    validate_regex(config.get("production_code_from_filename_regex") or config.get("filename_production_code_regex") or "", "production_code_from_filename_regex")
+    validate_regex(config.get("process_from_filename_regex") or config.get("filename_process_regex") or "", "process_from_filename_regex")
+    for metadata_name in ("production_code", "process_step"):
+        metadata_cfg = get_image_metadata_field_config(config, metadata_name)
+        if not metadata_cfg:
+            continue
+        if "roi" not in metadata_cfg:
+            raise ValueError(f"Image OCR metadata field {metadata_name} missing roi.")
+        normalize_image_roi(metadata_cfg.get("roi"), metadata_name)
+        if not str(metadata_cfg.get("regex") or "").strip():
+            raise ValueError(f"Image OCR metadata field {metadata_name} missing regex.")
+        validate_regex(metadata_cfg.get("regex"), metadata_name)
     required = [str(c).strip() for c in (required_metric_columns or metric_configs.keys()) if str(c).strip()]
     for metric_name in required:
         metric_cfg = metric_configs.get(metric_name)
@@ -660,10 +728,22 @@ def parse_image_parse_config(config_json: str, required_metric_columns=None):
         normalize_image_roi(metric_cfg.get("roi"), metric_name)
         if not str(metric_cfg.get("regex") or "").strip():
             raise ValueError(f"Image OCR metric {metric_name} missing regex.")
+        validate_regex(metric_cfg.get("regex"), metric_name)
     return config
 
 
-def find_stable_image_file(path: str, config: dict):
+def image_collects_multiple_files(config: dict):
+    mode = str(config.get("collect_mode") or config.get("file_selection") or "latest").strip().lower()
+    return mode in ("all", "all_stable", "all_new", "batch", "folder")
+
+
+def image_max_files_per_collect(config: dict):
+    default = 50 if image_collects_multiple_files(config) else 1
+    value = safe_int(config.get("max_files_per_collect", default), default)
+    return max(1, min(value, 500))
+
+
+def find_stable_image_files(path: str, config: dict):
     if not path:
         raise FileNotFoundError("Image source path is empty.")
     source = Path(path)
@@ -678,15 +758,25 @@ def find_stable_image_file(path: str, config: dict):
     if not candidates:
         raise FileNotFoundError(f"No supported image files found for path: {path}")
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    max_files = image_max_files_per_collect(config)
     last_error = None
+    selected = []
     for candidate in candidates:
         try:
             data, stat_info = _read_file_bytes_stably(str(candidate))
-            return str(candidate), data, stat_info
+            selected.append((str(candidate), data, stat_info))
+            if len(selected) >= max_files:
+                break
         except Exception as ex:
             last_error = ex
             continue
+    if selected:
+        return selected
     raise RuntimeError(f"No stable image file could be read from {path}: {last_error}")
+
+
+def find_stable_image_file(path: str, config: dict):
+    return find_stable_image_files(path, {**config, "collect_mode": "latest", "max_files_per_collect": 1})[0]
 
 
 def preprocess_image_roi_for_ocr(image_bytes: bytes, roi, ocr_config: dict):
@@ -714,10 +804,12 @@ def preprocess_image_roi_for_ocr(image_bytes: bytes, roi, ocr_config: dict):
     return Image.fromarray(arr), {"left": left, "top": top, "right": right, "bottom": bottom}
 
 
-def extract_regex_value(text: str, pattern: str, metric_name=""):
+def extract_named_regex_from_text(text: str, pattern: str, preferred_group: str = "", label: str = ""):
     match = re.search(pattern, text or "", re.IGNORECASE | re.MULTILINE)
     if not match:
-        raise ValueError(f"Image OCR text for {metric_name} did not match regex.")
+        raise ValueError(f"Image OCR text for {label} did not match regex.")
+    if preferred_group and preferred_group in match.groupdict():
+        return match.group(preferred_group).strip()
     if "value" in match.groupdict():
         return match.group("value").strip()
     if match.groups():
@@ -725,7 +817,11 @@ def extract_regex_value(text: str, pattern: str, metric_name=""):
     return match.group(0).strip()
 
 
-def run_image_ocr(image_bytes: bytes, image_path: str, config: dict, required_metric_columns):
+def extract_regex_value(text: str, pattern: str, metric_name=""):
+    return extract_named_regex_from_text(text, pattern, "value", metric_name)
+
+
+def run_image_ocr_with_metadata(image_bytes: bytes, image_path: str, config: dict, required_metric_columns):
     try:
         import pytesseract
     except ImportError as ex:
@@ -741,10 +837,30 @@ def run_image_ocr(image_bytes: bytes, image_path: str, config: dict, required_me
     extra_config = str(ocr_config.get("config") or "").strip()
     tesseract_config = f"--psm {psm}" + (f" {extra_config}" if extra_config else "")
     values = {}
+    metadata_values = {}
     debug = {
         "image_path": image_path,
+        "fields": {},
         "metrics": {}
     }
+    metadata_fields = {
+        "production_code": get_image_metadata_field_config(config, "production_code"),
+        "process_step": get_image_metadata_field_config(config, "process_step"),
+    }
+    for field_name, field_cfg in metadata_fields.items():
+        if not field_cfg:
+            continue
+        processed_image, pixel_roi = preprocess_image_roi_for_ocr(image_bytes, field_cfg["roi"], ocr_config)
+        raw_text = pytesseract.image_to_string(processed_image, lang=lang, config=tesseract_config)
+        value = extract_named_regex_from_text(raw_text, field_cfg["regex"], field_name, field_name)
+        metadata_values[field_name] = value
+        debug["fields"][field_name] = {
+            "roi": field_cfg["roi"],
+            "pixel_roi": pixel_roi,
+            "regex": field_cfg["regex"],
+            "ocr_text": raw_text,
+            "value": value
+        }
     for metric_name in required_metric_columns:
         metric_cfg = metric_configs.get(metric_name)
         processed_image, pixel_roi = preprocess_image_roi_for_ocr(image_bytes, metric_cfg["roi"], ocr_config)
@@ -758,47 +874,88 @@ def run_image_ocr(image_bytes: bytes, image_path: str, config: dict, required_me
             "ocr_text": raw_text,
             "value": value
         }
+    return values, debug, metadata_values
+
+
+def run_image_ocr(image_bytes: bytes, image_path: str, config: dict, required_metric_columns):
+    values, debug, _metadata_values = run_image_ocr_with_metadata(image_bytes, image_path, config, required_metric_columns)
     return values, debug
 
 
-def extract_process_from_filename(image_path: str, config: dict):
-    pattern = (config.get("process_from_filename_regex") or config.get("filename_process_regex") or "").strip()
+def extract_from_filename(image_path: str, pattern: str, preferred_group: str = ""):
     if not pattern:
         return ""
     target = Path(image_path).name
     match = re.search(pattern, target)
     if not match:
         return ""
-    if "process_step" in match.groupdict():
-        return match.group("process_step").strip()
+    if preferred_group and preferred_group in match.groupdict():
+        return match.group(preferred_group).strip()
+    if "value" in match.groupdict():
+        return match.group("value").strip()
     if match.groups():
         return match.group(1).strip()
     return match.group(0).strip()
+
+
+def extract_production_code_from_filename(image_path: str, config: dict):
+    pattern = (config.get("production_code_from_filename_regex") or config.get("filename_production_code_regex") or "").strip()
+    return extract_from_filename(image_path, pattern, "production_code")
+
+
+def extract_process_from_filename(image_path: str, config: dict):
+    pattern = (config.get("process_from_filename_regex") or config.get("filename_process_regex") or "").strip()
+    return extract_from_filename(image_path, pattern, "process_step")
 
 
 def read_image_rows(path: str, image_config_json: str, production_code: str, code_column: str,
                     fixed_process_step: str, process_column: str, required_metric_columns):
     required_metric_columns = [str(c).strip() for c in (required_metric_columns or []) if str(c).strip()]
     config = parse_image_parse_config(image_config_json, required_metric_columns)
-    image_path, image_bytes, stat_info = find_stable_image_file(path, config)
-    values, debug = run_image_ocr(image_bytes, image_path, config, required_metric_columns)
     code_field = code_column or "production_code"
-    row = {
-        code_field: production_code,
-        "_source_path": image_path,
-        "_source_mtime": datetime.fromtimestamp(stat_info.st_mtime, APP_TZ).isoformat(),
-        "_ocr": debug
-    }
-    if process_column:
-        row[process_column] = extract_process_from_filename(image_path, config) or fixed_process_step or ""
-    for metric_name in required_metric_columns:
-        row[metric_name] = values.get(metric_name, "")
+    process_column = image_config_process_column(config, process_column)
+    rows = []
+    labels = []
+    parse_errors = []
+    for image_path, image_bytes, stat_info in find_stable_image_files(path, config):
+        try:
+            values, debug, metadata_values = run_image_ocr_with_metadata(image_bytes, image_path, config, required_metric_columns)
+            parsed_production_code = (
+                extract_production_code_from_filename(image_path, config)
+                or metadata_values.get("production_code")
+                or production_code
+            )
+            row = {
+                code_field: parsed_production_code,
+                "_source_path": image_path,
+                "_source_mtime": datetime.fromtimestamp(stat_info.st_mtime, APP_TZ).isoformat(),
+                "_ocr": debug
+            }
+            if process_column:
+                row[process_column] = (
+                    extract_process_from_filename(image_path, config)
+                    or metadata_values.get("process_step")
+                    or fixed_process_step
+                    or ""
+                )
+            for metric_name in required_metric_columns:
+                row[metric_name] = values.get(metric_name, "")
+            rows.append(row)
+        except Exception as ex:
+            parse_errors.append({"image_path": image_path, "error": str(ex)})
+        labels.append(image_path)
+    if not rows and parse_errors:
+        raise RuntimeError("No image rows could be parsed. " + "; ".join(f"{e['image_path']}: {e['error']}" for e in parse_errors[:5]))
+    if parse_errors and rows:
+        rows[0]["_image_parse_errors"] = parse_errors[:20]
     fieldnames = [code_field]
     if process_column:
         fieldnames.append(process_column)
     fieldnames.extend(required_metric_columns)
     fieldnames.extend(["_source_path", "_source_mtime", "_ocr"])
-    return fieldnames, [row], f"image:{image_path}"
+    if parse_errors:
+        fieldnames.append("_image_parse_errors")
+    return fieldnames, rows, "image:" + ",".join(labels[:5]) + ("..." if len(labels) > 5 else "")
 
 
 def read_source_rows(data_source_type: str, path: str, encoding: str, delimiter: str, sheet_name: str = "", header_row_index: int = 1,
@@ -904,6 +1061,27 @@ def collect_item(item_id: int, dry_run=False):
     process_column = (item["process_step_column"] if "process_step_column" in item.keys() else "") or ""
     process_column = process_column.strip()
     fixed_process_step = (item["process_step"] or "").strip()
+    data_source_type = (item["data_source_type"] if "data_source_type" in item.keys() else "auto") or "auto"
+    image_source_hint = (
+        data_source_type.strip().lower() == "image"
+        or (
+            data_source_type.strip().lower() == "auto"
+            and (
+                Path(data_source_path or "").suffix.lower() in IMAGE_SUFFIXES
+                or (data_source_path and (Path(data_source_path).is_dir() or has_glob_pattern(data_source_path)))
+            )
+        )
+    )
+    image_config_for_collect = {}
+    image_dynamic_production = False
+    if image_source_hint:
+        try:
+            image_config_for_collect = json.loads(item["image_parse_config_json"] or "{}")
+            if isinstance(image_config_for_collect, dict):
+                process_column = image_config_process_column(image_config_for_collect, process_column)
+                image_dynamic_production = image_config_routes_by_production(image_config_for_collect)
+        except Exception:
+            image_config_for_collect = {}
 
     # V2.3: 禁止“无工序”采集。
     # 必须配置固定工序，或配置工序字段并从数据源中读取工序。
@@ -994,10 +1172,28 @@ def collect_item(item_id: int, dry_run=False):
                 "used_encoding": used_encoding
             }
 
-        matched = [r for r in rows if str(r.get(code_column, "")).strip() == str(production_code).strip()]
+        unknown_production_rows = 0
+        if image_dynamic_production:
+            production_rows = cur.execute("SELECT id, production_code FROM production_config").fetchall()
+            production_lookup = {str(r["production_code"]).strip(): r["id"] for r in production_rows}
+            matched = []
+            for row in rows:
+                row_code = str(row.get(code_column, "")).strip()
+                if row_code and row_code in production_lookup:
+                    row["_matched_production_code"] = row_code
+                    row["_matched_production_id"] = production_lookup[row_code]
+                    matched.append(row)
+                else:
+                    unknown_production_rows += 1
+        else:
+            matched = [r for r in rows if str(r.get(code_column, "")).strip() == str(production_code).strip()]
         if not matched:
             status = "NO_MATCHED_PRODUCTION_CODE"
-            msg = f"未找到生产编号 {production_code} 对应的数据行。"
+            if image_dynamic_production:
+                seen_codes = sorted({str(r.get(code_column, "")).strip() for r in rows if str(r.get(code_column, "")).strip()})
+                msg = f"图片中未识别到已配置的生产编号。识别到的编号：{', '.join(seen_codes) if seen_codes else '无'}。"
+            else:
+                msg = f"未找到生产编号 {production_code} 对应的数据行。"
             if not dry_run:
                 write_collect_log(cur, item, status, msg, 0, 0, 0)
                 update_item_status(cur, item_id, status)
@@ -1009,7 +1205,8 @@ def collect_item(item_id: int, dry_run=False):
                 "message": msg,
                 "fieldnames": fieldnames,
                 "used_encoding": used_encoding,
-                "matched_rows": 0
+                "matched_rows": 0,
+                "unknown_production_rows": unknown_production_rows
             }
 
         blank_process_rows = 0
@@ -1057,6 +1254,7 @@ def collect_item(item_id: int, dry_run=False):
         for row in target_rows[:20]:
             row_process_step = str(row.get(process_column, "")).strip() if process_column else ""
             preview_rows.append({
+                "production_code": str(row.get(code_column, "")).strip() or production_code,
                 "process_step": row_process_step or item["process_step"] or "",
                 "metrics": {m["metric_name"]: row.get(m["source_column"]) for m in metrics},
                 "row": row
@@ -1073,6 +1271,8 @@ def collect_item(item_id: int, dry_run=False):
                 "matched_rows": len(matched),
                 "selected_row": target_rows[-1],
                 "selected_rows": target_rows[:20],
+                "dynamic_production_routing": image_dynamic_production,
+                "unknown_production_rows": unknown_production_rows,
                 "process_step_column": process_column,
                 "collect_rows": len(target_rows),
                 "blank_process_rows_skipped": blank_process_rows,
@@ -1086,6 +1286,10 @@ def collect_item(item_id: int, dry_run=False):
             actual_source_path = target_row.get("_source_path") or data_source_path
             row_process_step = str(target_row.get(process_column, "")).strip() if process_column else ""
             effective_process_step = row_process_step or item["process_step"] or ""
+            effective_production_code = target_row.get("_matched_production_code") if image_dynamic_production else production_code
+            effective_production_code = str(effective_production_code or production_code).strip()
+            effective_production_id = target_row.get("_matched_production_id") if image_dynamic_production else item["production_id"]
+            effective_production_id = effective_production_id or item["production_id"]
             for m in metrics:
                 source_col = m["source_column"]
                 value_text = "" if target_row.get(source_col) is None else str(target_row.get(source_col)).strip()
@@ -1106,7 +1310,7 @@ def collect_item(item_id: int, dry_run=False):
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
-                        item["production_id"], production_code, item_id, item["item_name"],
+                        effective_production_id, effective_production_code, item_id, item["item_name"],
                         effective_process_step, item["execution_time_text"], item["equipment_name"],
                         m["metric_name"], value_text, value_number, m["unit"],
                         m["target"], m["lsl"], m["usl"], m["lcl"], m["ucl"], status,
@@ -1119,6 +1323,8 @@ def collect_item(item_id: int, dry_run=False):
 
         log_status = "SUCCESS"
         extra = f"，跳过空工序 {blank_process_rows} 行" if blank_process_rows else ""
+        if unknown_production_rows:
+            extra += f"，跳过未配置生产编号图片 {unknown_production_rows} 张"
         msg = f"采集成功：匹配 {len(matched)} 行，采集 {len(target_rows)} 行，新增 {inserted} 条，跳过重复 {skipped} 条{extra}。"
         write_collect_log(cur, item, log_status, msg, len(matched), inserted, skipped)
         update_item_status(cur, item_id, log_status)
@@ -1134,6 +1340,8 @@ def collect_item(item_id: int, dry_run=False):
             "skipped": skipped,
             "selected_row": target_rows[-1],
             "selected_rows": target_rows[:20],
+            "dynamic_production_routing": image_dynamic_production,
+            "unknown_production_rows": unknown_production_rows,
             "process_step_column": process_column,
             "blank_process_rows_skipped": blank_process_rows,
             "metric_preview": preview,
@@ -3157,7 +3365,7 @@ def page_about(user):
 PROD_A_V1,1.2,2.3,1.1,2.1,0.8
 PROD_B_V1,1.5,2.2,1.4,2.0,0.7</pre>
       <p>量测项中配置 <b>生产编号字段名=生产编号</b>，指标中配置 <b>Dx1、Dy1、Dx2、Dy2、Rz</b>，系统会读取当前生产编号对应行。</p>
-      <p class="note">V2.4 also supports Image OCR data sources for .png/.jpg/.jpeg/.bmp/.tif/.tiff. Configure ROI and regex in the measurement item to extract Rx/Ry/Z from fixed-layout equipment images.</p>
+      <p class="note">V2.5 also supports Image OCR data sources for .png/.jpg/.jpeg/.bmp/.tif/.tiff. Configure ROI and regex in the measurement item to extract Rx/Ry/Z from fixed-layout equipment images; shared image folders can route rows by production code parsed from filename or OCR.</p>
     </div>
     <div class="card">
       <h2>共享路径注意事项</h2>
@@ -3254,7 +3462,7 @@ class AppHandler(BaseHTTPRequestHandler):
         q = parse_qs(parsed.query)
 
         if path == "/version":
-            self.send_html("<h1>Metrology Config App V2.4</h1><p>PORT=8023</p><p>CSV/XLSX/Image OCR collection + multi-sheet template wizard + pie dashboard + result delete + process-required collection guard</p>")
+            self.send_html(f"<h1>Metrology Config App {h(APP_VERSION)}</h1><p>PORT={h(PORT)}</p><p>CSV/XLSX/Image OCR collection + shared image folder routing + multi-sheet template wizard + pie dashboard + result delete + process-required collection guard</p>")
             return
 
         if path == "/login":
@@ -3503,10 +3711,11 @@ class AppHandler(BaseHTTPRequestHandler):
         process_step_column_value = form.get("process_step_column", [""])[0].strip()
         data_source_type_value = form.get("data_source_type", ["auto"])[0]
         image_parse_config_value = form.get("image_parse_config_json", [""])[0].strip()
-        if not process_step_value and not process_step_column_value:
-            raise ValueError("量测项必须填写固定量测工序，或填写工序字段名；否则系统无法追溯数据属于哪道工序，且会禁止采集。")
         if data_source_type_value == "image":
-            parse_image_parse_config(image_parse_config_value)
+            image_config_value = parse_image_parse_config(image_parse_config_value)
+            process_step_column_value = image_config_process_column(image_config_value, process_step_column_value)
+        if not process_step_value and not process_step_column_value:
+            raise ValueError("量测项必须填写固定量测工序，或填写工序字段名；否则系统无法追溯数据属于哪道工序，且会禁止采集。图片 OCR 可通过 process_from_filename_regex 或 fields.process_step 自动提供工序。")
         vals = (
             production_id,
             form.get("item_name", [""])[0].strip(),

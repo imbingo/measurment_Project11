@@ -4,10 +4,11 @@
 
 ## 包内包含
 
-- `metrology_data_platform_v2_4/`: 已用 PyInstaller 打包好的 V2.4 程序，Python 运行时和 Python OCR 依赖已经包含在此目录。
+- `metrology_data_platform_v2_5/`: 已用 PyInstaller 打包好的 V2.5 程序，Python 运行时和 Python OCR 依赖已经包含在此目录。
 - `offline_ocr_bundle/tesseract_installer/`: Tesseract-OCR 离线安装程序。
 - `metrology_login_launcher.exe`: 日常桌面登录入口，双击后启动后台服务或连接已有服务器，并在独立桌面窗口中打开平台。
-- `start_metrology_v2_4_exe.ps1`: 产线启动脚本，会先安装或定位 Tesseract，再启动平台并打开浏览器。
+- `start_metrology_v2_5_exe.ps1`: 产线启动脚本，会先安装或定位 Tesseract，再启动 V2.5 平台并打开浏览器。
+- `start_metrology_v2_4_exe.ps1`: 兼容旧快捷方式的启动脚本，内部同样会优先启动 V2.5。
 - `test_8023_lan_port.ps1`: 局域网 8023 端口连通性测试脚本，不依赖平台主程序。
 
 ## 日常登录
@@ -33,13 +34,13 @@ metrology_login_launcher.exe
 在 PowerShell 中进入解压后的目录，运行：
 
 ```powershell
-.\start_metrology_v2_4_exe.ps1
+.\start_metrology_v2_5_exe.ps1
 ```
 
 默认会静默安装 Tesseract-OCR。如果公司 IT 要看到安装界面，运行：
 
 ```powershell
-.\start_metrology_v2_4_exe.ps1 -InteractiveInstall
+.\start_metrology_v2_5_exe.ps1 -InteractiveInstall
 ```
 
 启动后访问：
@@ -60,7 +61,7 @@ admin / admin123
 
 ```powershell
 $env:MDCP_TESSERACT_CMD="C:\Program Files\Tesseract-OCR\tesseract.exe"
-.\start_metrology_v2_4_exe.ps1
+.\start_metrology_v2_5_exe.ps1
 ```
 
 ## 端口
@@ -68,7 +69,7 @@ $env:MDCP_TESSERACT_CMD="C:\Program Files\Tesseract-OCR\tesseract.exe"
 如果 8023 被占用，可指定其他端口：
 
 ```powershell
-.\start_metrology_v2_4_exe.ps1 -Port 8030
+.\start_metrology_v2_5_exe.ps1 -Port 8030
 ```
 
 ## 局域网访问测试

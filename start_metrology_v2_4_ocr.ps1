@@ -13,7 +13,7 @@ if (-not (Test-Path -LiteralPath $installScript)) {
 }
 
 Write-Host "============================================================"
-Write-Host "Metrology Data Platform V2.4 - OCR offline startup"
+Write-Host "Metrology Data Platform V2.5 - OCR offline startup"
 Write-Host "URL: http://127.0.0.1:8023"
 Write-Host "============================================================"
 
