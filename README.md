@@ -49,6 +49,13 @@ $env:MDCP_ADMIN_PASSWORD="请改成强密码"
 python .\metrology_data_platform_v2_7.py
 ```
 
+可通过环境变量指定数据库文件，建议升级前先用数据库副本测试：
+
+```powershell
+$env:MDCP_DB_FILE="D:\mdcp_test\metrology_config_v1_copy.db"
+python .\metrology_data_platform_v2_7.py
+```
+
 ## 默认账号
 
 默认测试账号：
@@ -131,6 +138,37 @@ http://服务器内网IP:8023
 - Image OCR 配置为空或 JSON 解析失败
 - 模板没有指标
 - 模板缺少生产编号字段
+
+## 数据库升级与回滚
+
+产线试运行后，数据库必须连续继承，不能重建或清空。V2.7 启动时会检测数据库 schema 版本：
+
+- 数据库文件默认是 `metrology_config_v1.db`。
+- 可用 `MDCP_DB_FILE` 指向数据库副本或正式数据库。
+- 如果检测到需要迁移，程序会先自动备份当前数据库。
+- 备份目录是 `backup/`，文件名包含旧 schema 版本、新 schema 版本和时间戳。
+- 新增字段只通过 `ensure_column` 兼容迁移。
+- 新增表只使用 `CREATE TABLE IF NOT EXISTS`。
+- 禁止清空 `measurement_result`、`production_config`、`measurement_item_config`、`metric_config`、`template_config`、`collect_log`、`audit_log`。
+
+推荐升级步骤：
+
+1. 停止旧版本程序，确认没有采集正在运行。
+2. 复制正式数据库到测试目录。
+3. 设置 `MDCP_DB_FILE` 指向数据库副本。
+4. 启动 V2.7，确认 `backup/` 下生成迁移前备份。
+5. 登录测试：Dashboard、采集任务、配置检查、采集结果、模板详情。
+6. 测试通过后，停止程序。
+7. 设置 `MDCP_DB_FILE` 指向正式数据库，启动 V2.7。
+
+回滚步骤：
+
+1. 停止 V2.7。
+2. 从 `backup/` 找到升级前的 `.db` 备份。
+3. 复制备份文件覆盖正式数据库文件，或把 `MDCP_DB_FILE` 指向该备份文件。
+4. 使用旧版本入口启动，例如 V2.6 主文件仍保留为 `metrology_data_platform_v2_6.py`。
+
+注意：`*.db`、`*.db-wal`、`*.db-shm` 和 `backup/` 都不会提交到 GitHub。
 
 ## 数据源支持范围
 

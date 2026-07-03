@@ -20,6 +20,7 @@ venv/
 ~$*
 template_upload_cache/
 ocr_debug/
+backup/
 
 # Local generated workbooks and exports
 result_*.xlsx

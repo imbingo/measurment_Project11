@@ -28,6 +28,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import threading
 import time
@@ -44,7 +45,9 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 APP_VERSION = "V2.7"
 APP_TITLE = "量测数据采集配置平台 V2.7 - 稳定化增强版"
-DB_FILE = "metrology_config_v1.db"
+SCHEMA_VERSION = "V2.7.1"
+DB_FILE = os.environ.get("MDCP_DB_FILE", "metrology_config_v1.db")
+BACKUP_DIR = Path(os.environ.get("MDCP_BACKUP_DIR", "backup"))
 HOST = os.environ.get("MDCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MDCP_PORT", "8023"))
 SESSIONS = {}
@@ -194,11 +197,102 @@ def ensure_column(cur, table_name, column_name, column_sql):
     existing = {r["name"] for r in cur.execute(f"PRAGMA table_info({table_name})").fetchall()}
     if column_name not in existing:
         cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}")
+        return True
+    return False
+
+
+def sqlite_tables(conn):
+    return {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+
+
+def schema_version_from_conn(conn):
+    tables = sqlite_tables(conn)
+    if "schema_meta" not in tables:
+        return ""
+    row = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+    return row["value"] if row else ""
+
+
+def database_needs_migration(db_file):
+    db_path = Path(db_file)
+    if not db_path.exists() or db_path.stat().st_size == 0:
+        return False, ""
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = sqlite_tables(conn)
+        if not tables:
+            return False, ""
+        current_version = schema_version_from_conn(conn)
+        required_tables = {
+            "admin_user", "production_config", "measurement_item_config", "metric_config",
+            "measurement_result", "collect_log", "collect_job", "audit_log",
+            "template_config", "template_metric_config", "template_apply_log", "schema_meta"
+        }
+        if not required_tables.issubset(tables):
+            return True, current_version or "unknown"
+        required_columns = {
+            "production_config": {"production_code", "production_name", "product_model", "process_version", "description", "status", "created_at", "updated_at"},
+            "admin_user": {"role", "enabled", "updated_at"},
+            "measurement_item_config": {"production_id", "item_name", "process_step", "execution_time_text", "equipment_name", "data_source_type", "data_source_path", "excel_sheet_name", "image_parse_config_json", "header_row_index", "csv_encoding", "delimiter", "production_code_column", "process_step_column", "scan_frequency_seconds", "enabled", "last_collect_time", "last_collect_status", "created_at", "updated_at"},
+            "metric_config": {"item_id", "metric_name", "source_column", "unit", "data_type", "target", "lsl", "usl", "lcl", "ucl", "enabled", "sort_order", "created_at", "updated_at"},
+            "measurement_result": {"production_id", "production_code", "item_id", "measurement_item_name", "process_step", "execution_time_text", "equipment_name", "metric_name", "metric_value_text", "metric_value_number", "unit", "target", "lsl", "usl", "lcl", "ucl", "result_status", "source_path", "source_row_hash", "source_metric_hash", "collect_time", "raw_row_json", "is_voided", "voided_by", "voided_at", "void_reason", "source_file_path", "source_file_mtime", "ocr_raw_text", "ocr_roi_json", "ocr_confidence", "ocr_config_json"},
+            "collect_log": {"production_id", "production_code", "item_id", "measurement_item_name", "data_source_path", "status", "message", "matched_rows", "inserted_count", "skipped_count", "created_at"},
+            "audit_log": {"username", "action", "object_type", "object_id", "detail", "ip_address", "created_at"},
+            "template_config": {"template_name", "template_version", "data_source_type", "header_row_index", "delimiter", "encoding", "excel_sheet_name", "production_code_column", "process_step_column", "sample_fields_json", "description", "created_at", "updated_at"},
+            "template_metric_config": {"template_id", "metric_name", "source_column", "data_type", "unit", "target", "lsl", "usl", "lcl", "ucl", "sort_order", "created_at", "updated_at"},
+            "template_apply_log": {"template_id", "production_id", "production_code", "item_id", "applied_by", "applied_at", "template_name", "template_version", "snapshot_json", "detail"},
+        }
+        for table, columns in required_columns.items():
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()} if table in tables else set()
+            if not columns.issubset(existing):
+                return True, current_version or "unknown"
+        if current_version != SCHEMA_VERSION:
+            return True, current_version or "unknown"
+        return False, current_version
+    finally:
+        conn.close()
+
+
+def backup_database_before_migration(db_file, from_version, to_version):
+    db_path = Path(db_file)
+    if not db_path.exists() or db_path.stat().st_size == 0:
+        return ""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(APP_TZ).strftime("%Y%m%d_%H%M%S")
+    safe_from = re.sub(r"[^A-Za-z0-9_.-]+", "_", from_version or "unknown")
+    safe_to = re.sub(r"[^A-Za-z0-9_.-]+", "_", to_version or "unknown")
+    backup_path = BACKUP_DIR / f"{db_path.stem}_{safe_from}_to_{safe_to}_{timestamp}.db"
+    try:
+        src = sqlite3.connect(str(db_path))
+        dst = sqlite3.connect(str(backup_path))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+    except Exception:
+        shutil.copy2(db_path, backup_path)
+    return str(backup_path)
 
 
 def init_db():
+    needs_migration, from_schema_version = database_needs_migration(DB_FILE)
+    backup_path = ""
+    if needs_migration:
+        backup_path = backup_database_before_migration(DB_FILE, from_schema_version, SCHEMA_VERSION)
+        print(f"[db_migration] backup created before schema migration: {backup_path}")
+
     conn = get_conn()
     cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS schema_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TEXT
+    )
+    """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS admin_user (
@@ -428,14 +522,72 @@ def init_db():
     )
     """)
 
+    ensure_column(cur, "production_config", "production_name", "production_name TEXT")
+    ensure_column(cur, "production_config", "product_model", "product_model TEXT")
+    ensure_column(cur, "production_config", "process_version", "process_version TEXT")
+    ensure_column(cur, "production_config", "description", "description TEXT")
+    ensure_column(cur, "production_config", "status", "status TEXT DEFAULT 'enabled'")
+    ensure_column(cur, "production_config", "created_at", "created_at TEXT")
+    ensure_column(cur, "production_config", "updated_at", "updated_at TEXT")
     ensure_column(cur, "admin_user", "role", "role TEXT DEFAULT 'admin'")
     ensure_column(cur, "admin_user", "enabled", "enabled INTEGER DEFAULT 1")
     ensure_column(cur, "admin_user", "updated_at", "updated_at TEXT")
+    ensure_column(cur, "measurement_item_config", "production_id", "production_id INTEGER")
+    ensure_column(cur, "measurement_item_config", "item_name", "item_name TEXT")
+    ensure_column(cur, "measurement_item_config", "process_step", "process_step TEXT")
+    ensure_column(cur, "measurement_item_config", "execution_time_text", "execution_time_text TEXT")
+    ensure_column(cur, "measurement_item_config", "equipment_name", "equipment_name TEXT")
     ensure_column(cur, "measurement_item_config", "data_source_type", "data_source_type TEXT DEFAULT 'auto'")
+    ensure_column(cur, "measurement_item_config", "data_source_path", "data_source_path TEXT")
     ensure_column(cur, "measurement_item_config", "excel_sheet_name", "excel_sheet_name TEXT")
     ensure_column(cur, "measurement_item_config", "image_parse_config_json", "image_parse_config_json TEXT")
     ensure_column(cur, "measurement_item_config", "header_row_index", "header_row_index INTEGER DEFAULT 1")
+    ensure_column(cur, "measurement_item_config", "csv_encoding", "csv_encoding TEXT DEFAULT 'auto'")
+    ensure_column(cur, "measurement_item_config", "delimiter", "delimiter TEXT DEFAULT ','")
+    ensure_column(cur, "measurement_item_config", "production_code_column", "production_code_column TEXT DEFAULT '生产编号'")
     ensure_column(cur, "measurement_item_config", "process_step_column", "process_step_column TEXT")
+    ensure_column(cur, "measurement_item_config", "scan_frequency_seconds", "scan_frequency_seconds INTEGER DEFAULT 60")
+    ensure_column(cur, "measurement_item_config", "enabled", "enabled INTEGER DEFAULT 1")
+    ensure_column(cur, "measurement_item_config", "last_collect_time", "last_collect_time TEXT")
+    ensure_column(cur, "measurement_item_config", "last_collect_status", "last_collect_status TEXT")
+    ensure_column(cur, "measurement_item_config", "created_at", "created_at TEXT")
+    ensure_column(cur, "measurement_item_config", "updated_at", "updated_at TEXT")
+    ensure_column(cur, "metric_config", "item_id", "item_id INTEGER")
+    ensure_column(cur, "metric_config", "metric_name", "metric_name TEXT")
+    ensure_column(cur, "metric_config", "source_column", "source_column TEXT")
+    ensure_column(cur, "metric_config", "unit", "unit TEXT")
+    ensure_column(cur, "metric_config", "data_type", "data_type TEXT DEFAULT 'number'")
+    ensure_column(cur, "metric_config", "target", "target REAL")
+    ensure_column(cur, "metric_config", "lsl", "lsl REAL")
+    ensure_column(cur, "metric_config", "usl", "usl REAL")
+    ensure_column(cur, "metric_config", "lcl", "lcl REAL")
+    ensure_column(cur, "metric_config", "ucl", "ucl REAL")
+    ensure_column(cur, "metric_config", "enabled", "enabled INTEGER DEFAULT 1")
+    ensure_column(cur, "metric_config", "sort_order", "sort_order INTEGER DEFAULT 0")
+    ensure_column(cur, "metric_config", "created_at", "created_at TEXT")
+    ensure_column(cur, "metric_config", "updated_at", "updated_at TEXT")
+    ensure_column(cur, "measurement_result", "production_id", "production_id INTEGER")
+    ensure_column(cur, "measurement_result", "production_code", "production_code TEXT")
+    ensure_column(cur, "measurement_result", "item_id", "item_id INTEGER")
+    ensure_column(cur, "measurement_result", "measurement_item_name", "measurement_item_name TEXT")
+    ensure_column(cur, "measurement_result", "process_step", "process_step TEXT")
+    ensure_column(cur, "measurement_result", "execution_time_text", "execution_time_text TEXT")
+    ensure_column(cur, "measurement_result", "equipment_name", "equipment_name TEXT")
+    ensure_column(cur, "measurement_result", "metric_name", "metric_name TEXT")
+    ensure_column(cur, "measurement_result", "metric_value_text", "metric_value_text TEXT")
+    ensure_column(cur, "measurement_result", "metric_value_number", "metric_value_number REAL")
+    ensure_column(cur, "measurement_result", "unit", "unit TEXT")
+    ensure_column(cur, "measurement_result", "target", "target REAL")
+    ensure_column(cur, "measurement_result", "lsl", "lsl REAL")
+    ensure_column(cur, "measurement_result", "usl", "usl REAL")
+    ensure_column(cur, "measurement_result", "lcl", "lcl REAL")
+    ensure_column(cur, "measurement_result", "ucl", "ucl REAL")
+    ensure_column(cur, "measurement_result", "result_status", "result_status TEXT")
+    ensure_column(cur, "measurement_result", "source_path", "source_path TEXT")
+    ensure_column(cur, "measurement_result", "source_row_hash", "source_row_hash TEXT")
+    ensure_column(cur, "measurement_result", "source_metric_hash", "source_metric_hash TEXT")
+    ensure_column(cur, "measurement_result", "collect_time", "collect_time TEXT")
+    ensure_column(cur, "measurement_result", "raw_row_json", "raw_row_json TEXT")
     ensure_column(cur, "measurement_result", "is_voided", "is_voided INTEGER DEFAULT 0")
     ensure_column(cur, "measurement_result", "voided_by", "voided_by TEXT")
     ensure_column(cur, "measurement_result", "voided_at", "voided_at TEXT")
@@ -446,13 +598,76 @@ def init_db():
     ensure_column(cur, "measurement_result", "ocr_roi_json", "ocr_roi_json TEXT")
     ensure_column(cur, "measurement_result", "ocr_confidence", "ocr_confidence REAL")
     ensure_column(cur, "measurement_result", "ocr_config_json", "ocr_config_json TEXT")
+    ensure_column(cur, "collect_log", "production_id", "production_id INTEGER")
+    ensure_column(cur, "collect_log", "production_code", "production_code TEXT")
+    ensure_column(cur, "collect_log", "item_id", "item_id INTEGER")
+    ensure_column(cur, "collect_log", "measurement_item_name", "measurement_item_name TEXT")
+    ensure_column(cur, "collect_log", "data_source_path", "data_source_path TEXT")
+    ensure_column(cur, "collect_log", "status", "status TEXT")
+    ensure_column(cur, "collect_log", "message", "message TEXT")
+    ensure_column(cur, "collect_log", "matched_rows", "matched_rows INTEGER DEFAULT 0")
+    ensure_column(cur, "collect_log", "inserted_count", "inserted_count INTEGER DEFAULT 0")
+    ensure_column(cur, "collect_log", "skipped_count", "skipped_count INTEGER DEFAULT 0")
+    ensure_column(cur, "collect_log", "created_at", "created_at TEXT")
+    ensure_column(cur, "audit_log", "username", "username TEXT")
+    ensure_column(cur, "audit_log", "action", "action TEXT")
+    ensure_column(cur, "audit_log", "object_type", "object_type TEXT")
+    ensure_column(cur, "audit_log", "object_id", "object_id TEXT")
+    ensure_column(cur, "audit_log", "detail", "detail TEXT")
+    ensure_column(cur, "audit_log", "ip_address", "ip_address TEXT")
+    ensure_column(cur, "audit_log", "created_at", "created_at TEXT")
+    ensure_column(cur, "template_config", "template_name", "template_name TEXT")
+    ensure_column(cur, "template_config", "template_version", "template_version TEXT DEFAULT 'v1.0'")
+    ensure_column(cur, "template_config", "data_source_type", "data_source_type TEXT DEFAULT 'csv'")
+    ensure_column(cur, "template_config", "header_row_index", "header_row_index INTEGER DEFAULT 1")
+    ensure_column(cur, "template_config", "delimiter", "delimiter TEXT DEFAULT ','")
+    ensure_column(cur, "template_config", "encoding", "encoding TEXT DEFAULT 'auto'")
     ensure_column(cur, "template_config", "excel_sheet_name", "excel_sheet_name TEXT")
+    ensure_column(cur, "template_config", "production_code_column", "production_code_column TEXT")
     ensure_column(cur, "template_config", "process_step_column", "process_step_column TEXT")
+    ensure_column(cur, "template_config", "sample_fields_json", "sample_fields_json TEXT")
+    ensure_column(cur, "template_config", "description", "description TEXT")
+    ensure_column(cur, "template_config", "created_at", "created_at TEXT")
+    ensure_column(cur, "template_config", "updated_at", "updated_at TEXT")
+    ensure_column(cur, "template_metric_config", "template_id", "template_id INTEGER")
+    ensure_column(cur, "template_metric_config", "metric_name", "metric_name TEXT")
+    ensure_column(cur, "template_metric_config", "source_column", "source_column TEXT")
+    ensure_column(cur, "template_metric_config", "data_type", "data_type TEXT DEFAULT 'number'")
+    ensure_column(cur, "template_metric_config", "unit", "unit TEXT")
+    ensure_column(cur, "template_metric_config", "target", "target REAL")
+    ensure_column(cur, "template_metric_config", "lsl", "lsl REAL")
+    ensure_column(cur, "template_metric_config", "usl", "usl REAL")
+    ensure_column(cur, "template_metric_config", "lcl", "lcl REAL")
+    ensure_column(cur, "template_metric_config", "ucl", "ucl REAL")
+    ensure_column(cur, "template_metric_config", "sort_order", "sort_order INTEGER DEFAULT 0")
+    ensure_column(cur, "template_metric_config", "created_at", "created_at TEXT")
+    ensure_column(cur, "template_metric_config", "updated_at", "updated_at TEXT")
+    ensure_column(cur, "template_apply_log", "template_id", "template_id INTEGER")
+    ensure_column(cur, "template_apply_log", "production_id", "production_id INTEGER")
+    ensure_column(cur, "template_apply_log", "production_code", "production_code TEXT")
+    ensure_column(cur, "template_apply_log", "item_id", "item_id INTEGER")
+    ensure_column(cur, "template_apply_log", "applied_by", "applied_by TEXT")
+    ensure_column(cur, "template_apply_log", "applied_at", "applied_at TEXT")
     ensure_column(cur, "template_apply_log", "template_name", "template_name TEXT")
     ensure_column(cur, "template_apply_log", "template_version", "template_version TEXT")
     ensure_column(cur, "template_apply_log", "snapshot_json", "snapshot_json TEXT")
+    ensure_column(cur, "template_apply_log", "detail", "detail TEXT")
     cur.execute("UPDATE admin_user SET role='admin' WHERE COALESCE(role,'')=''")
     cur.execute("UPDATE admin_user SET enabled=1 WHERE enabled IS NULL")
+
+    def set_schema_meta(key, value):
+        row = cur.execute("SELECT key FROM schema_meta WHERE key=?", (key,)).fetchone()
+        if row:
+            cur.execute("UPDATE schema_meta SET value=?, updated_at=? WHERE key=?", (value, now_str(), key))
+        else:
+            cur.execute("INSERT INTO schema_meta (key, value, updated_at) VALUES (?, ?, ?)", (key, value, now_str()))
+
+    set_schema_meta("schema_version", SCHEMA_VERSION)
+    set_schema_meta("app_version", APP_VERSION)
+    if backup_path:
+        set_schema_meta("last_migration_backup", backup_path)
+        set_schema_meta("last_migration_from", from_schema_version or "unknown")
+        set_schema_meta("last_migration_at", now_str())
 
     admin_username = os.environ.get("MDCP_ADMIN_USERNAME", "admin")
     admin_password = os.environ.get("MDCP_ADMIN_PASSWORD", "admin123")
@@ -3041,13 +3256,7 @@ def delete_metric_config(metric_id):
 
 
 def clear_collect_logs():
-    conn = get_conn()
-    cur = conn.cursor()
-    count = cur.execute("SELECT COUNT(*) AS c FROM collect_log").fetchone()["c"]
-    cur.execute("DELETE FROM collect_log")
-    conn.commit()
-    conn.close()
-    return count
+    raise RuntimeError("产线试运行阶段禁止清空 collect_log。请保留历史采集日志用于追溯。")
 
 
 def clear_orphan_measurement_results():
@@ -3081,20 +3290,7 @@ def clear_orphan_measurement_results():
 
 
 def prune_collect_logs(keep=100):
-    keep = max(0, int(keep))
-    conn = get_conn()
-    cur = conn.cursor()
-    before = cur.execute("SELECT COUNT(*) AS c FROM collect_log").fetchone()["c"]
-    cur.execute("""
-        DELETE FROM collect_log
-        WHERE id NOT IN (
-            SELECT id FROM collect_log ORDER BY created_at DESC, id DESC LIMIT ?
-        )
-    """, (keep,))
-    conn.commit()
-    after = cur.execute("SELECT COUNT(*) AS c FROM collect_log").fetchone()["c"]
-    conn.close()
-    return before - after
+    raise RuntimeError("产线试运行阶段禁止裁剪 collect_log。请保留完整历史采集日志用于追溯。")
 
 
 def page_collect_jobs(user):
@@ -3182,9 +3378,8 @@ def page_logs(user):
     jobs_html = "".join(f"""
     <tr><td>#{r['id']}</td><td>{h(r['production_code'])}</td><td>{h(r['measurement_item_name'])}</td><td>{h(r['trigger_type'])}</td><td>{badge(r['status'])}</td><td>{h(r['started_at'])}</td><td>{h(r['finished_at'])}</td><td>{h(r['duration_ms'])}</td><td>{h(r['inserted_count'])}</td><td>{h(r['error_message'])}</td></tr>
     """ for r in job_rows) or "<tr><td colspan='10'>暂无采集任务</td></tr>"
-    admin_tools = f"""
-      <form class="inline-form" method="post" action="/logs_prune" onsubmit="return confirm('确认只保留最近100条采集日志？')"><button class="secondary" type="submit">只保留最近100条</button></form>
-      <form class="inline-form" method="post" action="/logs_clear" onsubmit="return confirm('确认清空全部采集日志？该操作不删除采集结果。')"><button class="danger" type="submit">清空采集日志</button></form>
+    admin_tools = """
+      <p class="note">产线试运行阶段禁止清空或裁剪采集日志。历史日志必须保留，用于排查路径超时、采集失败和权限问题。</p>
       <form class="inline-form" method="post" action="/orphan_results_clear" onsubmit="return confirm('确认作废不属于当前有效生产编号/量测项配置的历史采集结果？')"><button class="danger" type="submit">作废无效历史结果</button></form>
     """ if can_manage_system(user) else ""
     return base_layout("采集日志", f"""
@@ -4619,16 +4814,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_html(page_import_config(user, f"导入成功，共 {result['count']} 个生产编号，ID={result['ids']}"))
             elif path == "/logs_clear":
                 require_permission(user, can_manage_system(user))
-                removed = clear_collect_logs()
-                write_audit(user.get("username"), "CLEAR_COLLECT_LOGS", "collect_log", "", f"清空采集日志 {removed} 条", self.client_address[0])
-                status, headers, data = redirect("/logs")
-                self.send_bytes(status, headers, data)
+                write_audit(user.get("username"), "LOG_RETENTION_PROTECTED", "collect_log", "", "产线试运行阶段拒绝清空采集日志", self.client_address[0])
+                self.send_html(base_layout("日志保留保护", "<h1>日志保留保护</h1><div class='card error'>产线试运行阶段禁止清空 collect_log，历史采集日志必须保留。</div><p><a class='btn secondary' href='/logs'>返回采集日志</a></p>", user), status=409)
             elif path == "/logs_prune":
                 require_permission(user, can_manage_system(user))
-                removed = prune_collect_logs(100)
-                write_audit(user.get("username"), "PRUNE_COLLECT_LOGS", "collect_log", "", f"清理采集日志 {removed} 条，保留最近100条", self.client_address[0])
-                status, headers, data = redirect("/logs")
-                self.send_bytes(status, headers, data)
+                write_audit(user.get("username"), "LOG_RETENTION_PROTECTED", "collect_log", "", "产线试运行阶段拒绝裁剪采集日志", self.client_address[0])
+                self.send_html(base_layout("日志保留保护", "<h1>日志保留保护</h1><div class='card error'>产线试运行阶段禁止裁剪 collect_log，历史采集日志必须保留。</div><p><a class='btn secondary' href='/logs'>返回采集日志</a></p>", user), status=409)
             elif path == "/orphan_results_clear":
                 require_permission(user, can_void_results(user))
                 removed = clear_orphan_measurement_results()
