@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-import metrology_data_platform_v2_6 as app
+import metrology_data_platform_v2_7 as app
 
 
 class ImageOcrHelperTests(unittest.TestCase):
@@ -249,6 +249,12 @@ class ImageDynamicRoutingCollectTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["inserted"], 2)
         self.assertEqual(result["unknown_production_rows"], 1)
+        self.assertIn("job_id", result)
+        job = self.conn.execute("SELECT * FROM collect_job WHERE id=?", (result["job_id"],)).fetchone()
+        self.assertEqual(job["trigger_type"], "manual")
+        self.assertEqual(job["status"], "success")
+        self.assertEqual(job["matched_rows"], 2)
+        self.assertEqual(job["inserted_count"], 2)
         saved = self.conn.execute(
             """
             SELECT id, production_code, process_step, metric_value_text, source_file_path,

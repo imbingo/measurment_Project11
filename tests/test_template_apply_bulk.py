@@ -1,8 +1,9 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
-import metrology_data_platform_v2_6 as app
+import metrology_data_platform_v2_7 as app
 
 
 class TemplateApplyBulkTests(unittest.TestCase):
@@ -85,8 +86,13 @@ class TemplateApplyBulkTests(unittest.TestCase):
         ]
         self.assertEqual(metric_counts, [2, 1])
 
-        log_count = self.conn.execute("SELECT COUNT(*) AS c FROM template_apply_log").fetchone()["c"]
-        self.assertEqual(log_count, 2)
+        logs = self.conn.execute("SELECT * FROM template_apply_log ORDER BY id").fetchall()
+        self.assertEqual(len(logs), 2)
+        snapshot = json.loads(logs[0]["snapshot_json"])
+        self.assertEqual(snapshot["template_name"], "Demo-Rxy")
+        self.assertEqual(snapshot["production_code_column"], "production_code")
+        self.assertEqual([m["metric_name"] for m in snapshot["metrics"]], ["Rx", "Ry"])
+        self.assertEqual(snapshot["applied_item_config"]["data_source_path"], r"\\demo-server\metrology\result.csv")
 
     def test_legacy_single_template_id_still_works(self):
         form = {
@@ -102,6 +108,22 @@ class TemplateApplyBulkTests(unittest.TestCase):
         applied = app.handle_template_apply_bulk({"username": "admin", "role": "admin"}, form, "127.0.0.1")
         self.assertEqual(len(applied), 1)
         self.assertEqual(applied[0]["item_name"], "Demo-Rxy")
+
+    def test_viewer_cannot_apply_template(self):
+        form = {
+            "production_id": [str(self.production_id)],
+            "template_id": [str(self.template_a)],
+            "data_source_path": [r"\\demo-server\metrology\result.csv"],
+        }
+        with self.assertRaises(PermissionError):
+            app.handle_template_apply_bulk({"username": "viewer", "role": "viewer"}, form, "127.0.0.1")
+
+    def test_config_check_reports_template_without_metrics(self):
+        empty_template = self._insert_template("Empty-template", [])
+        self.conn.commit()
+        issues, summary, _total = app.config_check_issues()
+        self.assertIn("模板没有指标", summary)
+        self.assertTrue(any(i["template_id"] == empty_template for i in issues))
 
 
 if __name__ == "__main__":

@@ -7,30 +7,30 @@
 当前推荐入口文件：
 
 ```powershell
-python .\metrology_data_platform_v2_6.py
+python .\metrology_data_platform_v2_7.py
 ```
 
 版本信息：
 
 ```text
-APP_VERSION = V2.6
-APP_TITLE = 量测数据采集配置平台 V2.6 - 产品化整理版
+APP_VERSION = V2.7
+APP_TITLE = 量测数据采集配置平台 V2.7 - 稳定化增强版
 ```
 
-历史入口文件会继续保留，便于追溯和回退；新部署和试运行请使用 V2.6。
+历史入口文件会继续保留，便于追溯和回退；新部署和试运行请使用 V2.7。
 
 ## 快速启动
 
 PowerShell：
 
 ```powershell
-.\start_metrology_v2_6.ps1
+.\start_metrology_v2_7.ps1
 ```
 
 CMD：
 
 ```bat
-start_metrology_v2_6.bat
+start_metrology_v2_7.bat
 ```
 
 默认访问地址：
@@ -46,7 +46,7 @@ $env:MDCP_HOST="0.0.0.0"
 $env:MDCP_PORT="8023"
 $env:MDCP_DISPLAY_IP="192.168.1.20"
 $env:MDCP_ADMIN_PASSWORD="请改成强密码"
-python .\metrology_data_platform_v2_6.py
+python .\metrology_data_platform_v2_7.py
 ```
 
 ## 默认账号
@@ -59,6 +59,12 @@ admin / admin123
 
 `admin/admin123` 仅限本地测试。正式部署必须设置 `MDCP_ADMIN_PASSWORD`，也可设置 `MDCP_ADMIN_USERNAME`。
 
+V2.7 已落地最小角色权限：
+
+- `viewer`：查看 Dashboard、采集结果、采集日志、采集任务、模板和配置检查；不能新增、编辑、作废或手动采集。
+- `engineer`：可维护生产编号、量测项、指标和模板，可测试读取和手动采集；不能管理用户，不能作废结果。
+- `admin`：全部权限，包括用户管理、结果作废、日志清理和系统级操作。
+
 ## 局域网访问
 
 服务器电脑启动时设置：
@@ -66,7 +72,7 @@ admin / admin123
 ```powershell
 $env:MDCP_HOST="0.0.0.0"
 $env:MDCP_DISPLAY_IP="服务器内网IP"
-.\start_metrology_v2_6.ps1
+.\start_metrology_v2_7.ps1
 ```
 
 局域网其他电脑访问：
@@ -83,14 +89,48 @@ http://服务器内网IP:8023
 - 量测项和指标配置
 - CSV、Excel、Image OCR 数据源采集
 - 手动采集和定时采集
+- `collect_job` 采集任务生命周期追踪
 - 多 Sheet 模板解析和模板库
 - 新增生产编号时批量套用模板
+- 模板套用 snapshot 追溯
 - 采集结果查询、导出 Excel
 - 采集结果作废，不物理删除
 - OCR 原文、ROI、图片路径和配置快照追溯
-- Dashboard 统计、采集失败 Top、24 小时无数据提示、OCR 追溯风险提示
-- 配置完整性检查
+- Dashboard 统计、采集任务状态、采集失败 Top、24 小时无数据提示、OCR 追溯风险提示
+- 配置完整性检查页面和 Dashboard Top 问题
+- 最小用户管理和角色权限控制
 - 操作审计日志
+
+## V2.7 P1 稳定化增强
+
+### collect_job 采集任务追踪
+
+每次手动采集、定时采集和测试读取都会写入 `collect_job`：
+
+- `pending`：任务已创建
+- `running`：采集正在执行
+- `success`：采集完成
+- `failed`：采集失败
+- `timeout`：读取超时
+- `skipped`：同一量测项已有任务运行，跳过本次
+
+页面入口：`采集任务`。Dashboard 会显示最近 24 小时任务成功、失败、超时和运行中数量。
+
+### 模板套用 snapshot
+
+每次套用模板会在 `template_apply_log.snapshot_json` 保存完整快照，包括模板名称/版本、数据源类型、生产编号字段、工序字段、Excel Sheet、表头行、指标列表和实际生成的量测项配置。后续模板修改不会改变历史快照。
+
+### 配置完整性检查
+
+页面入口：`配置检查`。当前检查：
+
+- 无工序配置的量测项
+- 无启用指标的量测项
+- 数据源路径为空
+- Excel 数据源但 Sheet 未填写
+- Image OCR 配置为空或 JSON 解析失败
+- 模板没有指标
+- 模板缺少生产编号字段
 
 ## 数据源支持范围
 
@@ -133,7 +173,7 @@ http://服务器内网IP:8023
 }
 ```
 
-OCR 数据源必须保留追溯信息。V2.6 会尽量写入：
+OCR 数据源必须保留追溯信息。V2.7 会尽量写入：
 
 - `source_file_path`
 - `source_file_mtime`
@@ -182,3 +222,4 @@ $env:MDCP_TESSERACT_CMD="C:\Program Files\Tesseract-OCR\tesseract.exe"
 - 将采集 worker 与 Web 进程拆分
 - 迁移数据库到 PostgreSQL
 - 增加 OCR ROI 配置可视化工具
+
