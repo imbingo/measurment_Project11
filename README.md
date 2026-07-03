@@ -19,6 +19,8 @@ APP_TITLE = 量测数据采集配置平台 V2.7 - 稳定化增强版
 
 历史入口文件会继续保留，便于追溯和回退；新部署和试运行请使用 V2.7。
 
+客户/领导汇报材料见：[docs/customer_demo_metrology_data_platform.md](docs/customer_demo_metrology_data_platform.md)。
+
 ## 快速启动
 
 PowerShell：

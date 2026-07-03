@@ -18,6 +18,7 @@ venv/
 # Temporary files
 *.tmp
 ~$*
+test_runtime/
 template_upload_cache/
 ocr_debug/
 backup/
