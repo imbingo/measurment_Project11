@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyc
 
 # Runtime databases and local state
 *.db
@@ -18,6 +19,7 @@ venv/
 *.tmp
 ~$*
 template_upload_cache/
+ocr_debug/
 
 # Local generated workbooks and exports
 result_*.xlsx
@@ -31,6 +33,7 @@ build_pyinstaller/
 build_launcher/
 release_staging/
 dist_exe/
+dist/*_exe_offline/
 dist_launcher/
 offline_ocr_bundle/
 .env.ocr.ps1

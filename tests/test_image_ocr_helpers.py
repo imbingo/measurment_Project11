@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-import metrology_config_app_v2_3_pie_delete_process_guard as app
+import metrology_data_platform_v2_6 as app
 
 
 class ImageOcrHelperTests(unittest.TestCase):
@@ -56,6 +56,14 @@ class ImageOcrHelperTests(unittest.TestCase):
         }
         parsed = app.parse_image_parse_config(json.dumps(config), ["Rx"])
         self.assertTrue(app.image_config_routes_by_production(parsed))
+
+    def test_route_by_image_production_requires_route_source(self):
+        config = {
+            "route_by_image_production_code": True,
+            "metrics": {"Rx": {"roi": [0.1, 0.1, 0.2, 0.2], "regex": r"Rx=(\d+)"}},
+        }
+        with self.assertRaisesRegex(ValueError, "requires production_code_from_filename_regex"):
+            app.parse_image_parse_config(json.dumps(config), ["Rx"])
 
     def test_read_image_rows_scans_multiple_images_and_uses_filename_code_process(self):
         config = {
@@ -215,7 +223,24 @@ class ImageDynamicRoutingCollectTests(unittest.TestCase):
 
     def test_collect_item_routes_image_rows_to_parsed_production_codes(self):
         rows = [
-            {"生产编号": "PROD_A", "工序": "STEP1", "Rx": "1.23", "_source_path": "a.png"},
+            {
+                "生产编号": "PROD_A",
+                "工序": "STEP1",
+                "Rx": "1.23",
+                "_source_path": "a.png",
+                "_source_mtime": "2026-07-03 08:00:00",
+                "_ocr": {
+                    "metrics": {
+                        "Rx": {
+                            "roi": [0.1, 0.1, 0.2, 0.2],
+                            "pixel_roi": {"left": 10, "top": 10, "right": 30, "bottom": 30},
+                            "regex": r"Rx=(\d+)",
+                            "ocr_text": "Rx=1.23",
+                            "value": "1.23",
+                        }
+                    }
+                },
+            },
             {"生产编号": "PROD_B", "工序": "STEP2", "Rx": "4.56", "_source_path": "b.png"},
             {"生产编号": "PROD_X", "工序": "STEP3", "Rx": "7.89", "_source_path": "x.png"},
         ]
@@ -225,12 +250,31 @@ class ImageDynamicRoutingCollectTests(unittest.TestCase):
         self.assertEqual(result["inserted"], 2)
         self.assertEqual(result["unknown_production_rows"], 1)
         saved = self.conn.execute(
-            "SELECT production_code, process_step, metric_value_text FROM measurement_result ORDER BY production_code"
+            """
+            SELECT id, production_code, process_step, metric_value_text, source_file_path,
+                   source_file_mtime, ocr_raw_text, ocr_roi_json, ocr_confidence, ocr_config_json
+            FROM measurement_result ORDER BY production_code
+            """
         ).fetchall()
         self.assertEqual(
             [(r["production_code"], r["process_step"], r["metric_value_text"]) for r in saved],
             [("PROD_A", "STEP1", "1.23"), ("PROD_B", "STEP2", "4.56")],
         )
+        self.assertEqual(saved[0]["source_file_path"], "a.png")
+        self.assertEqual(saved[0]["source_file_mtime"], "2026-07-03 08:00:00")
+        self.assertEqual(saved[0]["ocr_raw_text"], "Rx=1.23")
+        self.assertIn("pixel_roi", saved[0]["ocr_roi_json"])
+        self.assertIsNone(saved[0]["ocr_confidence"])
+        self.assertIn("route_by_image_production_code", saved[0]["ocr_config_json"])
+
+        production_code, process_step, metric_name = app.delete_result(saved[0]["id"], "admin", "reviewed")
+        self.assertEqual((production_code, process_step, metric_name), ("PROD_A", "STEP1", "Rx"))
+        voided = self.conn.execute("SELECT * FROM measurement_result WHERE id=?", (saved[0]["id"],)).fetchone()
+        self.assertEqual(voided["is_voided"], 1)
+        self.assertEqual(voided["voided_by"], "admin")
+        self.assertEqual(voided["void_reason"], "reviewed")
+        self.assertEqual(len(app.fetch_result_rows({}, limit=10)), 1)
+        self.assertEqual(len(app.fetch_result_rows({"show_voided": ["1"]}, limit=10)), 2)
 
 
 if __name__ == "__main__":

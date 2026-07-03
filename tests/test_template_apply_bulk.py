@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import metrology_config_app_v2_3_pie_delete_process_guard as app
+import metrology_data_platform_v2_6 as app
 
 
 class TemplateApplyBulkTests(unittest.TestCase):
