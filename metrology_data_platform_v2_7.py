@@ -64,6 +64,8 @@ FILE_STABLE_WAIT_SECONDS = float(os.environ.get("MDCP_FILE_STABLE_WAIT_SECONDS",
 READ_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.environ.get("MDCP_READ_WORKERS", "4")))
 DISPLAY_IP = os.environ.get("MDCP_DISPLAY_IP", "10.21.210.75")
 TEMPLATE_CACHE_DIR = Path(os.environ.get("MDCP_TEMPLATE_CACHE_DIR", "template_upload_cache"))
+DEMO_DATA_DIR = Path(os.environ.get("MDCP_DEMO_DATA_DIR", str(Path(__file__).resolve().parent / "demo_data")))
+DEMO_CSV_FILENAME = "customer_acceptance_results.csv"
 # Default UNC path shown in the new-item form. Kept as a module constant because an
 # f-string expression cannot contain a backslash on Python < 3.12 (PEP 701).
 DEFAULT_DATA_SOURCE_PATH_EXAMPLE = r"\\192.168.1.100\share\result.xlsx"
@@ -88,6 +90,22 @@ DEFAULT_IMAGE_PARSE_CONFIG_JSON = json.dumps({
         "Z": {"roi": [0.05, 0.38, 0.30, 0.12], "regex": r"Z\s*[:=]?\s*([-+]?\d+(?:\.\d+)?)"}
     }
 }, ensure_ascii=False, indent=2)
+
+DEMO_CSV_TEXT = """生产编号,工序,批次,设备,CD,Overlay_X,Overlay_Y,Rz
+DEMO_WAFER_A01,PHOTO_CD,LOT-A-0726,CDSEM-01,49.8,0.4,-0.3,9.6
+DEMO_WAFER_A01,ETCH_PROFILE,LOT-A-0726,PROFILER-02,51.2,0.7,-0.4,10.2
+DEMO_WAFER_A01,FINAL_AOI,LOT-A-0726,AOI-03,52.6,2.1,-0.8,12.8
+DEMO_WAFER_B02,PHOTO_CD,LOT-B-0726,CDSEM-01,48.9,-0.9,1.0,8.4
+DEMO_WAFER_B02,ETCH_PROFILE,LOT-B-0726,PROFILER-02,54.4,1.8,-2.2,13.2
+DEMO_WAFER_B02,FINAL_AOI,LOT-B-0726,AOI-03,56.3,3.4,-2.9,14.8
+"""
+
+DEMO_METRICS = [
+    {"metric_name": "CD", "source_column": "CD", "unit": "nm", "target": 50.0, "lsl": 45.0, "usl": 55.0, "lcl": 48.5, "ucl": 51.5, "sort_order": 1},
+    {"metric_name": "Overlay_X", "source_column": "Overlay_X", "unit": "nm", "target": 0.0, "lsl": -3.0, "usl": 3.0, "lcl": -1.5, "ucl": 1.5, "sort_order": 2},
+    {"metric_name": "Overlay_Y", "source_column": "Overlay_Y", "unit": "nm", "target": 0.0, "lsl": -3.0, "usl": 3.0, "lcl": -1.5, "ucl": 1.5, "sort_order": 3},
+    {"metric_name": "Rz", "source_column": "Rz", "unit": "nm", "target": 10.0, "lsl": 6.0, "usl": 14.0, "lcl": 8.0, "ucl": 12.0, "sort_order": 4},
+]
 
 
 # ==========================================================
@@ -705,6 +723,262 @@ def write_audit(username, action, object_type="", object_id="", detail="", ip_ad
         conn.close()
     except Exception as ex:
         print("[audit_log_failed]", ex)
+
+
+# ==========================================================
+# Demo data
+# ==========================================================
+
+def demo_csv_path():
+    return DEMO_DATA_DIR / DEMO_CSV_FILENAME
+
+
+def ensure_demo_csv_file():
+    DEMO_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = demo_csv_path()
+    if not path.exists() or path.read_text(encoding="utf-8-sig") != DEMO_CSV_TEXT:
+        path.write_text(DEMO_CSV_TEXT, encoding="utf-8-sig")
+    return str(path)
+
+
+def upsert_demo_production(cur, production_code, production_name, description):
+    row = cur.execute("SELECT id FROM production_config WHERE production_code=?", (production_code,)).fetchone()
+    vals = (
+        production_name,
+        "Demo-Metrology",
+        "V1-demo",
+        description,
+        "enabled",
+        now_str(),
+        production_code,
+    )
+    if row:
+        cur.execute("""
+            UPDATE production_config
+            SET production_name=?, product_model=?, process_version=?, description=?, status=?, updated_at=?
+            WHERE production_code=?
+        """, vals)
+        return row["id"]
+    cur.execute("""
+        INSERT INTO production_config (
+            production_code, production_name, product_model, process_version, description, status, created_at, updated_at
+        ) VALUES (?, ?, 'Demo-Metrology', 'V1-demo', ?, 'enabled', ?, ?)
+    """, (production_code, production_name, description, now_str(), now_str()))
+    return cur.lastrowid
+
+
+def upsert_demo_template(cur):
+    template_name = "5分钟客户演示 CSV 模板"
+    sample_fields = ["生产编号", "工序", "批次", "设备", "CD", "Overlay_X", "Overlay_Y", "Rz"]
+    row = cur.execute("SELECT id FROM template_config WHERE template_name=?", (template_name,)).fetchone()
+    if row:
+        template_id = row["id"]
+        cur.execute("""
+            UPDATE template_config
+            SET template_version='v1.0', data_source_type='csv', header_row_index=1, delimiter=',',
+                encoding='auto', excel_sheet_name='', production_code_column='生产编号',
+                process_step_column='工序', sample_fields_json=?, description=?, updated_at=?
+            WHERE id=?
+        """, (
+            json.dumps(sample_fields, ensure_ascii=False),
+            "客户演示模板：从一份 CSV 采集两组生产编号、三道工序和四个指标。",
+            now_str(),
+            template_id,
+        ))
+    else:
+        cur.execute("""
+            INSERT INTO template_config (
+                template_name, template_version, data_source_type, header_row_index, delimiter, encoding,
+                excel_sheet_name, production_code_column, process_step_column, sample_fields_json,
+                description, created_at, updated_at
+            ) VALUES (?, 'v1.0', 'csv', 1, ',', 'auto', '', '生产编号', '工序', ?, ?, ?, ?)
+        """, (
+            template_name,
+            json.dumps(sample_fields, ensure_ascii=False),
+            "客户演示模板：从一份 CSV 采集两组生产编号、三道工序和四个指标。",
+            now_str(),
+            now_str(),
+        ))
+        template_id = cur.lastrowid
+
+    for metric in DEMO_METRICS:
+        row = cur.execute(
+            "SELECT id FROM template_metric_config WHERE template_id=? AND metric_name=?",
+            (template_id, metric["metric_name"]),
+        ).fetchone()
+        vals = (
+            metric["source_column"], "number", metric["unit"], metric["target"],
+            metric["lsl"], metric["usl"], metric["lcl"], metric["ucl"],
+            metric["sort_order"], now_str(), template_id, metric["metric_name"],
+        )
+        if row:
+            cur.execute("""
+                UPDATE template_metric_config
+                SET source_column=?, data_type=?, unit=?, target=?, lsl=?, usl=?, lcl=?, ucl=?,
+                    sort_order=?, updated_at=?
+                WHERE template_id=? AND metric_name=?
+            """, vals)
+        else:
+            cur.execute("""
+                INSERT INTO template_metric_config (
+                    template_id, metric_name, source_column, data_type, unit, target, lsl, usl, lcl, ucl,
+                    sort_order, created_at, updated_at
+                ) VALUES (?, ?, ?, 'number', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                template_id, metric["metric_name"], metric["source_column"], metric["unit"],
+                metric["target"], metric["lsl"], metric["usl"], metric["lcl"], metric["ucl"],
+                metric["sort_order"], now_str(), now_str(),
+            ))
+    return template_id
+
+
+def upsert_demo_item(cur, production_id, csv_path):
+    item_name = "Demo CSV 三工序量测"
+    row = cur.execute(
+        "SELECT id FROM measurement_item_config WHERE production_id=? AND item_name=?",
+        (production_id, item_name),
+    ).fetchone()
+    vals = (
+        "", "工序", "工序完成后自动采集", "Demo-Metrology-Line",
+        "csv", csv_path, "", "", 1, "auto", ",", "生产编号", 60, 1, now_str(),
+    )
+    if row:
+        item_id = row["id"]
+        cur.execute("""
+            UPDATE measurement_item_config
+            SET process_step=?, process_step_column=?, execution_time_text=?, equipment_name=?,
+                data_source_type=?, data_source_path=?, excel_sheet_name=?, image_parse_config_json=?,
+                header_row_index=?, csv_encoding=?, delimiter=?, production_code_column=?,
+                scan_frequency_seconds=?, enabled=?, updated_at=?
+            WHERE id=?
+        """, vals + (item_id,))
+    else:
+        cur.execute("""
+            INSERT INTO measurement_item_config (
+                production_id, item_name, process_step, process_step_column, execution_time_text, equipment_name,
+                data_source_type, data_source_path, excel_sheet_name, image_parse_config_json,
+                header_row_index, csv_encoding, delimiter, production_code_column,
+                scan_frequency_seconds, enabled, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (production_id, item_name) + vals[:-1] + (now_str(), now_str()))
+        item_id = cur.lastrowid
+
+    for metric in DEMO_METRICS:
+        row = cur.execute(
+            "SELECT id FROM metric_config WHERE item_id=? AND metric_name=?",
+            (item_id, metric["metric_name"]),
+        ).fetchone()
+        vals = (
+            metric["source_column"], "number", metric["unit"], metric["target"],
+            metric["lsl"], metric["usl"], metric["lcl"], metric["ucl"], 1,
+            metric["sort_order"], now_str(), item_id, metric["metric_name"],
+        )
+        if row:
+            cur.execute("""
+                UPDATE metric_config
+                SET source_column=?, data_type=?, unit=?, target=?, lsl=?, usl=?, lcl=?, ucl=?,
+                    enabled=?, sort_order=?, updated_at=?
+                WHERE item_id=? AND metric_name=?
+            """, vals)
+        else:
+            cur.execute("""
+                INSERT INTO metric_config (
+                    item_id, metric_name, source_column, data_type, unit, target, lsl, usl, lcl, ucl,
+                    enabled, sort_order, created_at, updated_at
+                ) VALUES (?, ?, ?, 'number', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            """, (
+                item_id, metric["metric_name"], metric["source_column"], metric["unit"],
+                metric["target"], metric["lsl"], metric["usl"], metric["lcl"], metric["ucl"],
+                metric["sort_order"], now_str(), now_str(),
+            ))
+    return item_id
+
+
+def seed_demo_data(user, ip_address=""):
+    require_permission(user, can_manage_config(user))
+    csv_path = ensure_demo_csv_file()
+    conn = get_conn()
+    cur = conn.cursor()
+    template_id = upsert_demo_template(cur)
+    production_specs = [
+        ("DEMO_WAFER_A01", "Demo 晶圆 A01", "演示：整体稳定，仅末道 AOI 有轻微 MS2 风险。"),
+        ("DEMO_WAFER_B02", "Demo 晶圆 B02", "演示：末道 AOI 出现超 MS2，需要客户追溯来源文件。"),
+    ]
+    item_ids = []
+    for code, name, description in production_specs:
+        production_id = upsert_demo_production(cur, code, name, description)
+        item_ids.append(upsert_demo_item(cur, production_id, csv_path))
+    cur.execute("""
+        UPDATE measurement_result
+        SET is_voided=0, voided_by='', voided_at='', void_reason=''
+        WHERE production_code IN ('DEMO_WAFER_A01', 'DEMO_WAFER_B02')
+    """)
+    conn.commit()
+    conn.close()
+
+    collect_results = []
+    for item_id in item_ids:
+        collect_results.append(COLLECTOR.collect_item(item_id, trigger_type="demo_seed", dry_run=False))
+
+    conn = get_conn()
+    summary = conn.execute("""
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN result_status IN ('MS3_PASS','PASS') THEN 1 ELSE 0 END) AS ms3_count,
+               SUM(CASE WHEN result_status IN ('MS2_PASS','OOC') THEN 1 ELSE 0 END) AS ms2_count,
+               SUM(CASE WHEN result_status IN ('MISS_MS2','OOS') THEN 1 ELSE 0 END) AS miss_count
+        FROM measurement_result
+        WHERE production_code IN ('DEMO_WAFER_A01', 'DEMO_WAFER_B02') AND COALESCE(is_voided,0)=0
+    """).fetchone()
+    conn.close()
+    inserted = sum(safe_int(r.get("inserted", 0), 0) for r in collect_results)
+    skipped = sum(safe_int(r.get("skipped", 0), 0) for r in collect_results)
+    write_audit(
+        user.get("username") if user else "system",
+        "SEED_DEMO_DATA",
+        "demo",
+        ",".join(str(x) for x in item_ids),
+        f"加载客户演示 Demo 数据，新增 {inserted} 条，跳过重复 {skipped} 条，模板ID={template_id}",
+        ip_address,
+    )
+    return {
+        "csv_path": csv_path,
+        "template_id": template_id,
+        "item_ids": item_ids,
+        "collect_results": collect_results,
+        "inserted": inserted,
+        "skipped": skipped,
+        "total": summary["total"] or 0,
+        "ms3_count": summary["ms3_count"] or 0,
+        "ms2_count": summary["ms2_count"] or 0,
+        "miss_count": summary["miss_count"] or 0,
+    }
+
+
+def log_request_exception(user, method, path, ex, ip_address=""):
+    request_id = secrets.token_hex(4)
+    detail = traceback.format_exc()
+    print(f"[request_error:{request_id}] {method} {path} user={(user or {}).get('username', 'anonymous')} ip={ip_address}\n{detail}")
+    write_audit(
+        (user or {}).get("username", "unknown"),
+        "REQUEST_ERROR",
+        "route",
+        path,
+        f"请求处理失败，错误编号 {request_id}：{ex}",
+        ip_address,
+    )
+    return request_id
+
+
+def page_request_error(user, request_id):
+    return base_layout("处理失败", f"""
+    <h1>处理失败</h1>
+    <div class="card">
+      <p class="error">当前操作没有完成。请记录错误编号并联系管理员查看服务端日志。</p>
+      <p><b>错误编号：</b>{h(request_id)}</p>
+      <p class="note">页面不会向客户展示内部路径和 traceback；详细信息已写入服务端日志和审计日志。</p>
+      <a class="btn secondary" href="/">返回 Dashboard</a>
+    </div>
+    """, user)
 
 # ==========================================================
 # CSV collection service
@@ -2050,8 +2324,9 @@ def base_layout(title, body, user=None):
     .note{font-size:13px;color:var(--muted);line-height:1.7}.error{color:var(--danger);font-size:14px}.success{color:var(--ok);font-size:14px}.login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0f172a,#1d4ed8)}.login-card{width:390px;background:white;border-radius:18px;padding:28px;box-shadow:0 18px 60px rgba(0,0,0,.25)}.login-card input,.login-card button{width:100%;margin:8px 0}.login-card p{color:var(--muted)}
     pre{background:#0b1020;color:#e5e7eb;padding:14px;border-radius:12px;overflow:auto}.actions{display:flex;gap:8px;flex-wrap:wrap}.small{font-size:12px;color:var(--muted)}
     .dash-grid{display:grid;grid-template-columns:1.15fr .85fr;gap:18px}.chart{width:100%;min-height:220px}.stack{height:12px;background:#eef2f7;border-radius:999px;overflow:hidden;display:flex}.seg-pass{background:#16a34a}.seg-ooc{background:#ea580c}.seg-oos{background:#dc2626}.bar-cell{min-width:180px}.bar-bg{height:10px;background:#eef2f7;border-radius:999px;overflow:hidden}.bar-fill{height:10px;background:#2563eb;border-radius:999px}.risk-fill{background:#dc2626}.warn-fill{background:#ea580c}.muted-fill{background:#64748b}
+    .quick-start{border-color:#bfdbfe;background:linear-gradient(180deg,#eff6ff,#fff)}.step-list{display:grid;grid-template-columns:repeat(4,minmax(170px,1fr));gap:12px;margin-top:12px}.step{border:1px solid var(--line);border-radius:12px;background:#fff;padding:12px}.step b{display:block;margin-bottom:6px}.step .num{display:inline-block;width:24px;height:24px;line-height:24px;text-align:center;border-radius:999px;background:#dbeafe;color:#1d4ed8;font-weight:800;margin-right:6px}.demo-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}.status-strip{display:flex;gap:10px;flex-wrap:wrap}.status-strip span{display:inline-block;border:1px solid var(--line);border-radius:12px;background:#fff;padding:9px 12px;font-weight:700}
     details.process-risk{border:1px solid var(--line);border-radius:12px;margin-bottom:10px;background:#fff}details.process-risk summary{cursor:pointer;padding:12px 14px;font-weight:700;display:flex;gap:14px;align-items:center;justify-content:space-between}.risk-meta{font-weight:500;color:var(--muted);font-size:13px}.risk-inner{padding:0 14px 14px}.link-button{background:none;border:none;color:var(--primary);padding:0;font-weight:700;cursor:pointer}.modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.55);display:none;align-items:center;justify-content:center;padding:24px;z-index:20}.modal-card{background:#fff;border-radius:16px;max-width:920px;width:100%;padding:18px;box-shadow:0 24px 80px rgba(0,0,0,.32)}.modal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
-    @media(max-width:900px){.grid{grid-template-columns:repeat(2,1fr)}.dash-grid{grid-template-columns:1fr}.layout{flex-direction:column}.sidebar{width:100%;display:flex;overflow:auto}.sidebar a{white-space:nowrap}.form-grid{grid-template-columns:1fr}}
+    @media(max-width:900px){.grid{grid-template-columns:repeat(2,1fr)}.dash-grid{grid-template-columns:1fr}.step-list{grid-template-columns:1fr}.layout{flex-direction:column}.sidebar{width:100%;display:flex;overflow:auto}.sidebar a{white-space:nowrap}.form-grid{grid-template-columns:1fr}}
     """
     if user:
         users_link = '<a href="/users">用户管理</a>' if can_manage_users(user) else ""
@@ -2112,6 +2387,37 @@ def page_login(error=""):
       </form>
     </div>
     """)
+
+
+def page_demo_ready(user, result):
+    collect_rows = "".join(
+        f"<tr><td>{h(r.get('job_id'))}</td><td>{badge(r.get('job_status'))}</td><td>{h(r.get('matched_rows'))}</td><td>{h(r.get('inserted'))}</td><td>{h(r.get('skipped'))}</td><td>{h(r.get('message'))}</td></tr>"
+        for r in result.get("collect_results", [])
+    ) or "<tr><td colspan='6'>暂无采集任务结果</td></tr>"
+    return base_layout("Demo 数据已加载", f"""
+    <h1>Demo 数据已加载</h1>
+    <div class="card quick-start">
+      <h2>客户演示数据准备完成</h2>
+      <div class="status-strip">
+        <span>结果 {result.get('total', 0)} 条</span>
+        <span>MS3 {result.get('ms3_count', 0)}</span>
+        <span>仅 MS2 {result.get('ms2_count', 0)}</span>
+        <span>未达 MS2 {result.get('miss_count', 0)}</span>
+        <span>本次新增 {result.get('inserted', 0)}</span>
+      </div>
+      <p class="note">Demo CSV：{h(result.get('csv_path'))}。重复加载会跳过已入库的重复结果，便于多次演示。</p>
+      <div class="demo-actions">
+        <a class="btn" href="/">查看 Dashboard</a>
+        <a class="btn secondary" href="/results?production_code=DEMO_WAFER">查看采集结果</a>
+        <a class="btn secondary" href="/collect_jobs">查看采集任务</a>
+        <a class="btn secondary" href="/templates">查看模板库</a>
+      </div>
+    </div>
+    <div class="card">
+      <h2>本次采集任务</h2>
+      <div class="table-wrap"><table><tr><th>任务ID</th><th>状态</th><th>匹配行</th><th>新增</th><th>跳过</th><th>说明</th></tr>{collect_rows}</table></div>
+    </div>
+    """, user)
 
 
 # ==========================================================
@@ -2622,6 +2928,10 @@ def page_dashboard(user, query=None):
             "item_name": item["item_name"],
             "issue": issue
         })
+    demo_result_count = conn.execute("""
+        SELECT COUNT(*) AS c FROM measurement_result
+        WHERE production_code IN ('DEMO_WAFER_A01', 'DEMO_WAFER_B02') AND COALESCE(is_voided,0)=0
+    """).fetchone()["c"]
     conn.close()
     config_issues, config_summary, config_issue_total = config_check_issues(limit=200)
     no_process_count = config_summary.get("无工序配置", 0)
@@ -2684,8 +2994,53 @@ def page_dashboard(user, query=None):
         )
     config_issue_html = "".join(config_issue_parts) or "<tr><td colspan='5'>暂无配置完整性问题</td></tr>"
     chart_json = json.dumps(trend_charts, ensure_ascii=False)
+    if total == 0 and can_manage_config(user):
+        quick_start_html = """
+        <div class="card quick-start">
+          <h2>5分钟客户演示路径</h2>
+          <p class="note">当前库还没有采集结果。可以先加载一组演示 CSV 数据，系统会自动创建生产编号、模板、量测项、指标，并执行一次真实采集。</p>
+          <div class="step-list">
+            <div class="step"><b><span class="num">1</span>加载 Demo</b><span class="note">生成两组生产编号、三道工序、四个指标。</span></div>
+            <div class="step"><b><span class="num">2</span>看 Dashboard</b><span class="note">马上看到 MS3/MS2/未达分布和趋势。</span></div>
+            <div class="step"><b><span class="num">3</span>追溯结果</b><span class="note">查看来源 CSV、采集任务和日志。</span></div>
+            <div class="step"><b><span class="num">4</span>复用模板</b><span class="note">展示新增料号时如何复用配置。</span></div>
+          </div>
+          <form method="post" action="/demo_seed" class="demo-actions">
+            <button type="submit">一键加载 Demo 数据</button>
+            <a class="btn secondary" href="/production_new">手动新增生产编号</a>
+            <a class="btn secondary" href="/template_upload">上传模板</a>
+          </form>
+        </div>
+        """
+    elif demo_result_count:
+        quick_start_html = f"""
+        <div class="card quick-start">
+          <h2>Demo 数据已就绪</h2>
+          <div class="status-strip">
+            <span>Demo 结果 {demo_result_count} 条</span>
+            <span>MS3 {ms3}</span>
+            <span>仅 MS2 {ms2}</span>
+            <span>未达 MS2 {miss}</span>
+          </div>
+          <div class="demo-actions">
+            <a class="btn" href="/results?production_code=DEMO_WAFER">查看采集结果</a>
+            <a class="btn secondary" href="/collect_jobs">查看采集任务</a>
+            <a class="btn secondary" href="/templates">查看模板库</a>
+            <a class="btn secondary" href="/config_checks">配置检查</a>
+          </div>
+        </div>
+        """
+    else:
+        quick_start_html = """
+        <div class="card quick-start">
+          <h2>开始配置</h2>
+          <p class="note">建议按“生产编号 → 模板/量测项 → 指标 → 测试读取 → 采集结果”的顺序完成首条数据闭环。</p>
+          <div class="demo-actions"><a class="btn" href="/productions">进入生产编号管理</a><a class="btn secondary" href="/templates">查看模板库</a></div>
+        </div>
+        """
     return base_layout("首页", f"""
     <h1>Dashboard</h1>
+    {quick_start_html}
     <div class="card"><form class="form-row" method="get" action="/"><label>生产编号</label><select name="production_code">{production_options}</select><label>开始日期</label><input type="date" name="start_date" value="{start_date}"><label>结束日期</label><input type="date" name="end_date" value="{end_date}"><button type="submit">更新看板</button><a class="btn secondary" href="/">今天</a></form><p class="note">当前统计区间：{start_date} 00:00:00 至 {end_date} 23:59:59。默认只统计当前仍在“生产编号管理”中的生产编号，已删除配置的历史结果不会进入 Dashboard。</p></div>
     <div class="grid">
       <div class="card metric"><div class="label">区间结果数</div><div class="value">{total}</div></div>
@@ -3014,6 +3369,7 @@ def page_results(user, query=None):
     conn = get_conn()
     rows = conn.execute(sql, params).fetchall()
     conn.close()
+    has_rows = bool(rows)
     status_values = ["MS3_PASS", "MS2_PASS", "MISS_MS2", "PASS", "TEXT"]
     status_options = "".join(f'<option value="{s}" {"selected" if result_status == s else ""}>{display_status(s)}</option>' for s in status_values)
     export_href = "/export_results_xlsx?" + urlencode({
@@ -3056,13 +3412,13 @@ def page_results(user, query=None):
     rows_html = "".join(row_parts) or "<tr><td colspan='14'>暂无结果</td></tr>"
     void_tools = """
     <form class="inline-form" method="post" action="/blank_process_results_clear" onsubmit="return confirm('确认作废全部空工序采集结果？')"><button class="danger" type="submit">作废空工序结果</button></form>
-    """ if void_allowed else ""
+    """ if void_allowed and has_rows else ""
     bulk_void_form = """
       <form id="bulkVoidResultsForm" method="post" action="/results_bulk_delete" onsubmit="return confirm('确认作废勾选的采集结果？')">
         <input name="void_reason" value="人工作废" placeholder="作废原因">
         <button class="danger" type="submit">批量作废</button>
       </form>
-    """ if void_allowed else "<p class='note'>当前账号无作废权限。</p>"
+    """ if void_allowed and has_rows else ("<p class='note'>暂无可作废结果；加载 Demo 数据或完成采集后再显示批量作废工具。</p>" if void_allowed else "<p class='note'>当前账号无作废权限。</p>")
     return base_layout("采集结果", f"""
     <h1>采集结果</h1>
     <div class="card"><form class="form-row" method="get" action="/results"><input name="production_code" value="{h(production_code)}" placeholder="生产编号"><input name="process_step" value="{h(process_step)}" placeholder="工序名"><input name="metric_name" value="{h(metric_name)}" placeholder="指标名"><select name="result_status"><option value="">全部状态</option>{status_options}</select><label><input type="checkbox" name="show_voided" value="1" {'checked' if show_voided else ''}> 显示已作废结果</label><button type="submit">查询</button><a class="btn secondary" href="/results">重置</a><a class="btn secondary" href="{export_href}">导出 Excel</a></form>{void_tools}</div>
@@ -3305,10 +3661,10 @@ def page_collect_jobs(user):
     rows_html = "".join(f"""
     <tr>
       <td>#{r['id']}</td><td>{h(r['production_code'])}</td><td>{h(r['measurement_item_name'])}</td>
-      <td>{h(r['data_source_type'])}</td><td>{h(r['data_source_path'])}</td><td>{h(r['trigger_type'])}</td>
-      <td>{badge(r['status'])}</td><td>{h(r['started_at'])}</td><td>{h(r['finished_at'])}</td>
-      <td>{h(r['duration_ms'])}</td><td>{h(r['matched_rows'])}</td><td>{h(r['collect_rows'])}</td>
-      <td>{h(r['inserted_count'])}</td><td>{h(r['skipped_count'])}</td><td>{h(r['failed_count'])}</td>
+      <td>{badge(r['status'])}</td><td>{h(r['trigger_type'])}</td><td>{h(r['duration_ms'])}</td>
+      <td>{h(r['matched_rows'])}</td><td>{h(r['collect_rows'])}</td><td>{h(r['inserted_count'])}</td>
+      <td>{h(r['skipped_count'])}</td><td>{h(r['failed_count'])}</td><td>{h(r['started_at'])}</td><td>{h(r['finished_at'])}</td>
+      <td>{h(r['data_source_type'])}</td><td title="{h(r['data_source_path'])}" style="max-width:360px;overflow:hidden;text-overflow:ellipsis">{h(r['data_source_path'])}</td>
       <td>{h(r['error_message'])}</td>
     </tr>
     """ for r in rows) or "<tr><td colspan='16'>暂无采集任务</td></tr>"
@@ -3316,7 +3672,7 @@ def page_collect_jobs(user):
     <h1>采集任务</h1>
     <div class="card note">每次手动采集、定时采集和测试读取都会生成一条任务记录，用于判断任务是否触发、是否运行中、是否超时、是否成功但没有匹配数据。</div>
     <div class="card"><div class="table-wrap"><table>
-      <tr><th>任务ID</th><th>生产编号</th><th>量测项</th><th>数据源类型</th><th>数据源</th><th>触发方式</th><th>状态</th><th>开始时间</th><th>结束时间</th><th>耗时ms</th><th>匹配行</th><th>采集行</th><th>新增</th><th>跳过</th><th>失败</th><th>失败原因</th></tr>
+      <tr><th>任务ID</th><th>生产编号</th><th>量测项</th><th>状态</th><th>触发方式</th><th>耗时ms</th><th>匹配行</th><th>采集行</th><th>新增</th><th>跳过</th><th>失败</th><th>开始时间</th><th>结束时间</th><th>数据源类型</th><th>数据源</th><th>失败原因</th></tr>
       {rows_html}
     </table></div></div>
     """, user)
@@ -3695,6 +4051,7 @@ def page_templates(user):
         ORDER BY t.id DESC
     """).fetchall()
     conn.close()
+    manage = can_manage_config(user)
     rows_html = "".join(f"""
     <tr>
       <td>{h(r['template_name'])}</td>
@@ -4806,6 +5163,9 @@ class AppHandler(BaseHTTPRequestHandler):
                     production_id = safe_int(form.get("production_id", [0])[0])
                     status, headers, data = redirect(f"/items?production_id={production_id}")
                 self.send_bytes(status, headers, data)
+            elif path == "/demo_seed":
+                result = seed_demo_data(user, self.client_address[0])
+                self.send_html(page_demo_ready(user, result))
             elif path == "/import_config":
                 require_permission(user, can_manage_config(user))
                 config_json = form.get("config_json", [""])[0]
@@ -4870,7 +5230,8 @@ class AppHandler(BaseHTTPRequestHandler):
             write_audit(user.get("username"), "PERMISSION_DENIED", "route", path, str(ex), self.client_address[0])
             self.send_html(base_layout("权限不足", f"<h1>权限不足</h1><div class='card error'>{h(ex)}</div>", user), status=403)
         except Exception as ex:
-            self.send_html(base_layout("错误", f"<h1>处理失败</h1><div class='card'><p class='error'>{h(ex)}</p><pre>{h(traceback.format_exc())}</pre></div>", user), status=500)
+            request_id = log_request_exception(user, self.command, path, ex, self.client_address[0])
+            self.send_html(page_request_error(user, request_id), status=500)
 
     def handle_production_save(self, form):
         require_permission(current_user(self), can_manage_config(current_user(self)))

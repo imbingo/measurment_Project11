@@ -250,6 +250,23 @@ $env:MDCP_TESSERACT_CMD="C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 无互联网产线电脑建议使用离线 EXE 包和公司 IT 分发流程。
 
+## 客户 Demo 与开发验证
+
+Dashboard 空库状态下会显示“5分钟客户演示路径”。管理员点击“一键加载 Demo 数据”后，系统会创建两组 Demo 生产编号、一个 CSV 字段模板、两个量测项和四个指标，并从 `demo_data/customer_acceptance_results.csv` 执行真实采集。客户可立即查看 Dashboard、采集结果、采集任务、模板库和配置检查。
+
+本地开发验证：
+
+```powershell
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+如习惯使用 pytest，可先安装开发依赖：
+
+```powershell
+pip install -r .\requirements-dev.txt
+pytest -q
+```
+
 ## 文档入口和后续计划
 
 - `README_EXE_OFFLINE.md`：产线离线 EXE 包说明
@@ -262,4 +279,3 @@ $env:MDCP_TESSERACT_CMD="C:\Program Files\Tesseract-OCR\tesseract.exe"
 - 将采集 worker 与 Web 进程拆分
 - 迁移数据库到 PostgreSQL
 - 增加 OCR ROI 配置可视化工具
-
